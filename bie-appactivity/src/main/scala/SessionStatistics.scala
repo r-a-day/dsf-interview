@@ -85,10 +85,110 @@ object SessionStatistics {
       )
         .withColumn("session_end_year", year(col("session_end_at")))
 
-    sessionStatsMain.write.insertInto(TargetTableName)
+    // sessionStatsMain.write.insertInto(TargetTableName)
 
 
     // TODO refactor for more flexible calculation of fraud features
+    
+
+    /* a Spendy user logging into their account from multiple devices in the same day
+    Assumption: 'same day' implies same calendar day (not 'within 24hrs')
+     */
+    // Create a deduped set of the source data for event_names containing 'login'
+    val loginEvents = sourceDF.select("user_id", "event_timestamp", "device_id", "event_name")
+      .filter(col("event_name").contains("login")).dropDuplicates()
+
+    // True when a user_id has ever used multiple device_id with event_names containing 'login' on the same day
+    val multiDvcSameUser = loginEvents
+      .withColumn("event_date", to_date(col("event_timestamp")))
+      .groupBy("user_id", "event_date")
+      .agg(countDistinct(col("device_id")).alias("num_devices"))
+      .withColumn("multi_device_uses", (col("num_devices") > 1))
+      .groupBy("user_id")
+      .agg(max(col("multi_device_uses")).alias("multi_device_user"))
+
+    /*
+    a Spendy user logging into their account from a new device
+    when they haven't logged into their account in the App for a long time
+    Assumption: 'long time' is over 4 weeks, event_name contains 'login',
+                new device is different device_id
+     */
+    // Filter for login events that occurred on a new device
+    val timeBetweenLogins = loginEvents
+      .withColumn("prev_event_timestamp", lag("event_timestamp", 1).over(eventTimeDistWindowSpec))
+      .withColumn("prev_device_id", lag("device_id", 1).over(eventTimeDistWindowSpec))
+      .withColumn("time_since_last_login", datediff(col("event_timestamp"), col("prev_event_timestamp")))
+
+    // Filter for logins that occurred more than 4 weeks since the last login
+    val longTimeNoLogin = timeBetweenLogins
+      .filter((col("time_since_last_login") > 24 * 7 * 4) && (col("device_id") =!= col("prev_device_id")))
+      .withColumn("long_time_no_login", lit(true))
+      .select("user_id", "long_time_no_login").dropDuplicates()
+
+    /* One device logging into multiple Spendy accounts over a short period of time
+    Assumption: 'short period of time' is within 1hr and event_name contains 'login'
+     */
+    // True when a device_id on a given day has multiple user_ids with event_names containing 'login'
+    val multiUserSameDvc = timeBetweenLogins
+      .filter((col("time_since_last_login") <= 1))
+      .withColumn("event_date", to_date(col("event_timestamp")))
+      .groupBy("device_id", "event_date")
+      .agg(countDistinct(col("user_id")).alias("num_users"))
+      .withColumn("multi_user_device", col("num_users") > 1)
+      .groupBy("device_id")
+      .agg(max(col("multi_user_device")).alias("multi_user_device"))
+
+    /*
+    a Spendy user after logging into their account from a new device,
+    immediately perform key actions such as change account information or make expensive purchase
+    Assumption: 'short period of time' is within 15min, event_name contains 'account' or 'info',
+                new device is different device_id
+     */
+    //
+//    val newDeviceLogins = loginEvents
+//      .withColumn("prev_event_timestamp", lag("event_timestamp", 1).over(eventTimeDistWindowSpec))
+//      .withColumn("prev_device_id", lag("device_id", 1).over(eventTimeDistWindowSpec))
+//      .withColumn("time_since_last_login",
+//        datediff(col("event_timestamp"), col("prev_event_timestamp"))
+//      ).filter(
+//        (col("device_id") =!= col("prev_device_id"))
+//      )
+
+//    val acctinfoEvents = sourceDF.select("user_id", "event_timestamp", "device_id", "event_name")
+//      .filter(col("event_name").contains("account") || col("event_name").contains("info"))
+//      .select("user_id").dropDuplicates()
+
+
+    /*a Spendy user spending more than 5 minutes looking at pages in the app that explain
+    where they can use Spendy to shop (these pages have an event name prefixed with "Shop ")
+    Assumption: event_name contains 'shop'
+     */
+    // Use time_spent_shopping to find user_ids looking at 'shop' event_names for more than 5min
+    val longShop = sessionStatsMain
+      .withColumn("longer_than_5min_shop", col("time_spent_in_shopping") > 5)
+      .groupBy("user_id")
+      .agg(max(col("longer_than_5min_shop")).alias("long_shopper"))
+
+    // Join multiple device users column on user_id
+    val sessionStatswithMDSU = sessionStatsMain
+      .join(multiDvcSameUser, Seq("user_id"), "left")
+
+    // Join long time no login until new device user column on user_id
+    val sessionStatswithLNL = sessionStatswithMDSU
+      .join(longTimeNoLogin, Seq("user_id"), "left")
+
+    // Join multiple user devices column on device_id
+    val sessionStatswithMUSD = sessionStatswithLNL
+      .join(multiUserSameDvc, Seq("device_id"), "left")
+
+    // Join long look shop users column on user_id
+    val sessionStatswithLongShop = sessionStatswithMUSD
+      .join(longShop, Seq("user_id"), "left")
+
+    sessionStatswithLongShop
+      .write.partitionBy("session_end_year")
+      .mode("overwrite")
+      .saveAsTable(TargetTableName)
   }
 
   private def createSparkSession(): SparkSession = {
